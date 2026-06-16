@@ -20,17 +20,10 @@ import os
 from contextlib import nullcontext
 from typing import List, Optional
 
-import deepspeed
 import torch
 import torch.distributed as dist
 import torch.optim as optim
 import yaml
-from deepspeed.runtime.zero.stage3 import \
-    estimate_zero3_model_states_mem_needs_all_live
-from deepspeed.runtime.zero.stage_1_and_2 import \
-    estimate_zero2_model_states_mem_needs_all_live
-from deepspeed.utils.zero_to_fp32 import \
-    convert_zero_checkpoint_to_fp32_state_dict
 from tensorboardX import SummaryWriter
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -49,6 +42,25 @@ from wenet.utils.fsdp_utils import (apply_fsdp_checkpointing,
                                     wenet_fsdp_wrap_policy)
 from wenet.utils.init_dataset import init_dataset
 from wenet.utils.scheduler import NoamHoldAnnealing, WarmupLR
+
+
+def _load_deepspeed():
+    try:
+        import deepspeed
+        from deepspeed.runtime.zero.stage3 import \
+            estimate_zero3_model_states_mem_needs_all_live
+        from deepspeed.runtime.zero.stage_1_and_2 import \
+            estimate_zero2_model_states_mem_needs_all_live
+        from deepspeed.utils.zero_to_fp32 import \
+            convert_zero_checkpoint_to_fp32_state_dict
+    except Exception as exc:
+        raise RuntimeError(
+            "DeepSpeed is required when train_engine=deepspeed, but it "
+            "failed to import. Check the installed torch/deepspeed versions."
+        ) from exc
+    return (deepspeed, estimate_zero2_model_states_mem_needs_all_live,
+            estimate_zero3_model_states_mem_needs_all_live,
+            convert_zero_checkpoint_to_fp32_state_dict)
 
 
 def add_model_args(parser):
@@ -209,8 +221,13 @@ def add_deepspeed_args(parser):
                         default='model_only',
                         choices=['model_only', 'model+optimizer'],
                         help='save model/optimizer states')
-    # DeepSpeed automaticly add '--deepspeed' and '--deepspeed_config' to parser
-    parser = deepspeed.add_config_arguments(parser)
+    parser.add_argument('--deepspeed',
+                        action='store_true',
+                        default=False,
+                        help='Enable DeepSpeed runtime')
+    parser.add_argument('--deepspeed_config',
+                        default=None,
+                        help='DeepSpeed config JSON path')
     return parser
 
 
@@ -264,6 +281,7 @@ def init_distributed(args):
             logging.error("not supported device: {}".format(args.device))
         dist.init_process_group(args.dist_backend)
     elif args.train_engine == "deepspeed":
+        deepspeed, _, _, _ = _load_deepspeed()
         deepspeed.init_distributed(dist_backend=args.dist_backend)
     else:
         logging.error("not supported engine: {}".format(args.train_engine))
@@ -420,6 +438,8 @@ def wrap_cuda_model(args, model, configs=None):
         model = torch.nn.parallel.DistributedDataParallel(
             model, find_unused_parameters=not grad_ckpt)
     elif args.train_engine == "deepspeed":  # deepspeed
+        (_, estimate_zero2_model_states_mem_needs_all_live,
+         estimate_zero3_model_states_mem_needs_all_live, _) = _load_deepspeed()
         # NOTE(xcsong): look in detail how the memory estimator API works:
         #   https://deepspeed.readthedocs.io/en/latest/memory.html#discussion
         if int(os.environ.get('RANK', 0)) == 0:
@@ -539,6 +559,7 @@ def init_optimizer_and_scheduler(args, configs, model):
     #   please set optimizer in ds_config.json, see:
     #   (https://www.deepspeed.ai/docs/config-json/#optimizer-parameters)
     if args.train_engine == "deepspeed":
+        deepspeed, _, _, _ = _load_deepspeed()
         with open(args.deepspeed_config, 'r') as fin:
             ds_configs = json.load(fin)
         if "optimizer" in ds_configs:
@@ -570,12 +591,14 @@ def trace_and_print_model(args, model):
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
     if int(os.environ.get('RANK', 0)) == 0:
+        num_params = sum(p.numel() for p in model.parameters())
+        logging.info('Model structure:\n%s', model)
+        logging.info('Model total parameters: {:,d}'.format(num_params))
         if args.jit:
             script_model = torch.jit.script(model)
             script_model.save(os.path.join(args.model_dir, 'init.zip'))
         if args.print_model:
             print(model)
-            num_params = sum(p.numel() for p in model.parameters())
             print('the number of model params: {:,d}'.format(num_params))
 
 
@@ -612,6 +635,7 @@ def save_model(model, info_dict):
     save_model_path = os.path.join(model_dir, '{}.pt'.format(tag))
     # save ckpt
     if info_dict["train_engine"] == "deepspeed":
+        _, _, _, convert_zero_checkpoint_to_fp32_state_dict = _load_deepspeed()
         # NOTE(xcsong): All ranks should call this API, but only rank 0
         #   save the general model params. see:
         #   https://github.com/microsoft/DeepSpeed/issues/2993

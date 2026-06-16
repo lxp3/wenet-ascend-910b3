@@ -16,9 +16,10 @@ fi
 # if you don't want to utilize all available NPU resources.
 export ASCEND_RT_VISIBLE_DEVICES="${npu_list}"
 echo "ASCEND_RT_VISIBLE_DEVICES is ${ASCEND_RT_VISIBLE_DEVICES}"
+export PYTHONWARNINGS="ignore:AutoNonVariableTypeMode is deprecated:UserWarning:torch.autograd"
 
-stage=4 # start from 0 if you need to start from data preparation
-stop_stage=4
+stage=$1 # start from 0 if you need to start from data preparation
+stop_stage=$2
 
 # You should change the following two parameters for multiple machine training,
 # see https://pytorch.org/docs/stable/elastic/run.html
@@ -28,16 +29,18 @@ job_id=2023
 
 # The aishell dataset location, please change this to your own path
 # make sure of using absolute path. DO-NOT-USE relatvie path!
-data=/export/data/asr-data/OpenSLR/33/
+#data=/export/data/asr-data/OpenSLR/33/
+data=/data/user/lxp/asr/datasets/aishell/raw
 data_url=www.openslr.org/resources/33
 
-nj=16
+nj=32
 dict=data/dict/lang_char.txt
 
 # data_type can be `raw` or `shard`. Typically, raw is used for small dataset,
 # `shard` is used for large dataset which is over 1k hours, and `shard` is
 # faster on reading data and training.
-data_type=raw
+#data_type=raw
+data_type=shard
 num_utts_per_shard=1000
 
 train_set=train
@@ -54,13 +57,14 @@ train_set=train
 train_config=conf/train_conformer.yaml
 dir=exp/conformer
 tensorboard_dir=tensorboard
-checkpoint=
+checkpoint=$dir/epoch_195.pt
 num_workers=8
 prefetch=10
 
 # use average_checkpoint will get better result
 average_checkpoint=true
 decode_checkpoint=$dir/final.pt
+#decode_checkpoint=$dir/epoch_230.pt
 average_num=30
 decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
 
